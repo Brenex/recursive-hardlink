@@ -1,126 +1,90 @@
 #!/usr/bin/env python3
-"""Find identical files across torrent/media trees, then optionally hardlink them.
+"""Recursively hardlink identical target files to files in a master directory.
 
-Linux / Python 3.9+; standard library only. Run --help, scan --help, apply --help.
+Linux / Python 3.9+, standard library only.
 
-Quick start (scan never changes files in either tree):
-  python3 hardlink-matches.py scan --plan hardlink-plan.json
-  python3 hardlink-matches.py show --plan hardlink-plan.json --limit 20
-  python3 hardlink-matches.py apply --plan hardlink-plan.json --limit 5
-  python3 hardlink-matches.py apply --plan hardlink-plan.json
+Preview:
+  python3 hardlink-matches.py --master /path/to/master --target /path/to/target
+Apply:
+  python3 hardlink-matches.py --master /path/to/master --target /path/to/target --apply
 
-Defaults: /mnt/user/data/torrents and /mnt/user/data/media, recursively, all regular
-files, independent of filename or folder layout. Source symlinks/special files
-are skipped. Existing (device, inode) matches need no hashing. Other candidates
-are filtered by size and sampled content, then matched with full SHA-256 hashes.
-Scan writes a JSON report/plan plus a resumable SQLite hash cache OUTSIDE the trees.
-Plan creation refuses to overwrite an existing plan. Use a new filename to rescan.
+Both paths must be existing, separate directories. Matching uses contents,
+independently of filenames and folder layouts. Eligible target entries become
+hardlinks to retained master files at their existing target paths.
 
-Apply keeps torrent files as the source, replacing only media directory entries.
-It reopens paths without following symlinks, checks recorded file identities,
-compares every byte again, and checks the planned hash. It creates a temporary
-hardlink in the media directory, verifies it, then atomically replaces the media
-name. There is no delete-first step, copying fallback, or cross-disk migration.
-Failures before replacement leave the media entry in place. A crash may leave a
-temporary .hardlink-match-*.tmp link; inspect it before removing it.
-
-Review statuses are never applied: conflicting ownership/mode/extended attributes,
-media files linked elsewhere, or different filesystem device IDs. Matching device
-IDs on Unraid do NOT guarantee that a link will work: link() is authoritative.
-Unsupported/cross-device operations are logged, without replacing the media file.
-The JSONL apply log lives alongside the plan; apply can be rerun safely.
-
-Pause downloads, Sonarr/Radarr imports, mover/balancing, and any other writers
-before applying. Scan can run while services are active but may report changed
-files; rescan those with the trees stable. File checks/advisory locks are not a
-lock against other applications, nor a transaction over the entire tree.
-
-Hardlinks share contents, mode, ownership, xattrs and timestamps. The source's
-mtime wins if the two copies had different mtimes. Editing either hardlink in
-place edits the same file. Potential savings are logical duplicate bytes, NOT
-guaranteed physical space reclaimed (reflinks, sparse files, snapshots, open FDs).
-Neither tree is accessible remotely from ChatGPT: run this on your Unraid host.
+Matching uses size, sampled content and full SHA-256, followed by another full
+byte comparison immediately before replacement. Existing links, metadata
+conflicts and targets already linked elsewhere are skipped. On Unraid, actual
+link creation is the final filesystem compatibility check. Pause writers and
+Mover while applying. Earlier replacements remain if a later operation fails.
+Hardlinks share contents, file metadata and timestamps.
 """
 
 import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timezone
 import errno
 import fcntl
 import hashlib
-import json
 import os
 from pathlib import Path
-import sqlite3
+import signal
 import stat
 import sys
-import tempfile
 import time
+from typing import NamedTuple
 import uuid
 
-FORMAT = "hardlink-matches-v1"
 BLOCK = 4 * 1024 * 1024
 SAMPLE = 64 * 1024
-STATE_FIELDS = ("dev", "ino", "size", "mtime_ns", "ctime_ns", "mode", "uid", "gid", "nlink")
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+class FileState(NamedTuple):
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    mode: int
+    uid: int
+    gid: int
+    links: int
+
+
+class LinkUnavailable(Exception):
+    """Hardlink creation failed before replacement."""
 
 
 def log(message):
     print(message, flush=True)
 
 
-def timestamp():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def state(st):
-    return dict(zip(STATE_FIELDS, (st.st_dev, st.st_ino, st.st_size,
-        st.st_mtime_ns, st.st_ctime_ns, st.st_mode, st.st_uid, st.st_gid, st.st_nlink)))
+def state(snapshot):
+    return FileState(snapshot.st_dev, snapshot.st_ino, snapshot.st_size,
+            snapshot.st_mtime_ns, snapshot.st_ctime_ns, snapshot.st_mode,
+            snapshot.st_uid, snapshot.st_gid, snapshot.st_nlink)
 
 
 def inode(entry):
-    return (entry["state"]["dev"], entry["state"]["ino"])
+    return entry["state"].device, entry["state"].inode
 
 
-def assert_state(st, expected, source=False):
-    actual = state(st)
-    fields = [k for k in STATE_FIELDS if not source or k not in ("ctime_ns", "nlink")]
-    if not stat.S_ISREG(st.st_mode) or any(actual[k] != expected[k] for k in fields):
-        raise ValueError("File changed since scan/check; rescan before applying")
-
-
-def inside(path, root):
-    return os.path.commonpath((str(path), str(root))) == str(root)
-
-
-def roots(torrents, media):
-    torrent_root = Path(torrents).resolve(strict=True)
-    media_root = Path(media).resolve(strict=True)
-    if not torrent_root.is_dir() or not media_root.is_dir():
-        raise ValueError("Both roots must be directories")
-    if inside(torrent_root, media_root) or inside(media_root, torrent_root) or os.path.samefile(torrent_root, media_root):
-        raise ValueError("Trees must be distinct and non-overlapping")
-    return torrent_root, media_root
-
-
-def output_path(path, tree_roots):
-    path = Path(path).absolute()
-    resolved = path.resolve()
-    if any(inside(resolved, root) for root in tree_roots):
-        raise ValueError("Keep plans, logs and cache files outside the scanned trees")
-    if path.is_symlink():
-        raise ValueError("Output path must not be a symlink: " + repr(str(path)))
-    if not path.parent.is_dir():
-        raise ValueError("Output parent directory does not exist: " + repr(str(path.parent)))
-    return path
+def check_state(snapshot, expected, after_link=False):
+    actual = state(snapshot)
+    if after_link:
+        # Creating our link changes these two fields on the retained master inode.
+        actual = actual._replace(changed_ns=expected.changed_ns, links=expected.links)
+    if not stat.S_ISREG(snapshot.st_mode) or actual != expected:
+        raise ValueError("File changed during the run. Stabilize the trees and rerun.")
 
 
 def open_directory(path):
-    """Open an absolute directory path, rejecting symlinks in every component."""
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open("/", DIRECTORY_FLAGS)
     try:
-        for part in Path(path).parts[1:]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        for component in Path(path).parts[1:]:
+            next_fd = os.open(component, DIRECTORY_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = next_fd
         return fd
@@ -132,12 +96,12 @@ def open_directory(path):
 @contextmanager
 def parent_fd(root, path):
     parts = Path(path).relative_to(root).parts
-    if not parts or any(part in ("..", ".") for part in parts):
-        raise ValueError("Invalid file path beneath root")
+    if not parts or ".." in parts:
+        raise ValueError("File path must be beneath its directory root")
     fd = open_directory(root)
     try:
-        for part in parts[:-1]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        for component in parts[:-1]:
+            next_fd = os.open(component, DIRECTORY_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = next_fd
         yield fd, parts[-1]
@@ -147,27 +111,24 @@ def parent_fd(root, path):
 
 @contextmanager
 def open_entry(root, entry):
-    with parent_fd(root, entry["path"]) as (directory, name):
-        # O_NONBLOCK ensures a regular-file-to-FIFO race cannot hang the process.
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    with parent_fd(root, entry["path"]) as (parent, name):
+        fd = os.open(name, FILE_FLAGS, dir_fd=parent)
         try:
-            assert_state(os.fstat(fd), entry["state"])
+            check_state(os.fstat(fd), entry["state"])
             yield fd
-            assert_state(os.fstat(fd), entry["state"])
+            check_state(os.fstat(fd), entry["state"])
         finally:
             os.close(fd)
 
 
 def xattrs(fd):
-    """Digest all extended attributes, including ACLs, without storing their values."""
     digest = hashlib.sha256()
     try:
         names = sorted(os.listxattr(fd))
     except OSError as exc:
-        if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
-            names = []
-        else:
+        if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
             raise
+        names = []
     for name in names:
         encoded = os.fsencode(name)
         value = os.getxattr(fd, name)
@@ -176,408 +137,266 @@ def xattrs(fd):
     return digest.hexdigest()
 
 
-def metadata(root, entry):
+def entry_xattrs(root, entry):
     with open_entry(root, entry) as fd:
-        attrs = xattrs(fd)
-    s = entry["state"]
-    return {"mode": s["mode"], "uid": s["uid"], "gid": s["gid"], "xattrs": attrs}
+        return xattrs(fd)
 
 
-def inventory(root, errors):
+def inventory(root, counts):
     entries = []
-    skipped = 0
-    def walk_error(exc):
-        errors.append({"path": str(exc.filename), "error": str(exc)})
-    for directory, directories, names in os.walk(root, followlinks=False, onerror=walk_error):
+
+    def scan_error(exc):
+        raise exc
+
+    for directory, directories, names in os.walk(root, followlinks=False, onerror=scan_error):
         directories.sort()
         for name in directories[:]:
-            path = Path(directory) / name
-            if path.is_symlink():
+            if (Path(directory) / name).is_symlink():
                 directories.remove(name)
-                skipped += 1
+                counts["symlinks_or_special"] += 1
         for name in sorted(names):
             path = Path(directory) / name
-            try:
-                st = path.lstat()
-                if stat.S_ISREG(st.st_mode):
-                    entries.append({"path": str(path), "state": state(st)})
-                    if len(entries) % 5000 == 0:
-                        log("Inventory: {:,} regular files under {}".format(len(entries), root))
-                else:
-                    skipped += 1
-            except OSError as exc:
-                errors.append({"path": str(path), "error": str(exc)})
-    log("Inventory: {:,} files, {:,} symlinks/special entries skipped: {}".format(len(entries), skipped, root))
-    return entries, skipped
+            snapshot = path.lstat()
+            if stat.S_ISREG(snapshot.st_mode):
+                entries.append({"path": str(path), "state": state(snapshot)})
+                if len(entries) % 5000 == 0:
+                    log(f"Scanned {len(entries):,} files under {str(root)!r}")
+            else:
+                counts["symlinks_or_special"] += 1
+    log(f"Scanned {len(entries):,} files under {str(root)!r}")
+    return entries
 
 
 class Hashes:
-    def __init__(self, path):
-        self.db = sqlite3.connect(str(path))
-        self.db.execute("CREATE TABLE IF NOT EXISTS hashes (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        self.memory = {}
+    """Reuse hashes of unchanged inodes within this run."""
+
+    def __init__(self):
+        self.cache = {}
         self.last_progress = time.monotonic()
-        self.cache_hits = 0
-        self.bytes_read = 0
 
-    def close(self):
-        self.db.close()
-
-    def get(self, root, entry, kind):
-        key = json.dumps(["sha256-v1", kind, entry["state"]], sort_keys=True)
+    def get(self, root, entry, sample=False):
+        key = (sample, entry["state"])
         with open_entry(root, entry) as fd:
-            if key in self.memory:
-                self.cache_hits += 1
-                return self.memory[key]
-            cached = self.db.execute("SELECT value FROM hashes WHERE key=?", (key,)).fetchone()
-            if cached:
-                self.cache_hits += 1
-                self.memory[key] = cached[0]
-                return cached[0]
+            if key in self.cache:
+                return self.cache[key]
             digest = hashlib.sha256()
-            size = entry["state"]["size"]
-            if kind == "sample":
-                for offset in sorted({0, max(0, size // 2 - SAMPLE // 2), max(0, size - SAMPLE)}):
+            size = entry["state"].size
+            if sample:
+                offsets = {0, max(0, size // 2 - SAMPLE // 2), max(0, size - SAMPLE)}
+                for offset in sorted(offsets):
                     data = os.pread(fd, min(SAMPLE, size - offset), offset)
                     if len(data) != min(SAMPLE, size - offset):
-                        raise ValueError("Short read while sampling " + repr(entry["path"]))
+                        raise ValueError(f"Short read while sampling {entry['path']!r}")
                     digest.update(offset.to_bytes(8, "big") + data)
-                    self.bytes_read += len(data)
             else:
                 total = 0
                 while True:
-                    block = os.read(fd, BLOCK)
-                    if not block:
+                    data = os.read(fd, BLOCK)
+                    if not data:
                         break
-                    digest.update(block)
-                    total += len(block)
-                    self.bytes_read += len(block)
+                    digest.update(data)
+                    total += len(data)
                     if time.monotonic() - self.last_progress >= 15:
-                        log("Hashing {:.2f}/{:.2f} GiB: {!r}".format(total / 2**30, size / 2**30, entry["path"]))
+                        log(f"Hashing {total / 2**30:.2f}/{size / 2**30:.2f} GiB: {entry['path']!r}")
                         self.last_progress = time.monotonic()
                 if total != size:
-                    raise ValueError("File size changed during hashing")
-            assert_state(os.fstat(fd), entry["state"])
-            result = digest.hexdigest()
-            self.db.execute("INSERT OR REPLACE INTO hashes VALUES (?, ?)", (key, result))
-            self.db.commit()
-            self.memory[key] = result
-            return result
+                    raise ValueError(f"File size changed while hashing {entry['path']!r}")
+            check_state(os.fstat(fd), entry["state"])
+            self.cache[key] = digest.hexdigest()
+            return self.cache[key]
 
 
-def save_plan(path, plan):
-    # Exclusive publication: never overwrite a reviewed plan, even if it appears
-    # during scanning. The temporary report is on the same filesystem as the plan.
-    fd, temporary = tempfile.mkstemp(prefix=".hardlink-plan-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(plan, handle, indent=2, ensure_ascii=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-    finally:
-        os.unlink(temporary)
-
-
-def scan(args):
-    torrent_root, media_root = roots(args.torrents, args.media)
-    plan_path = output_path(args.plan, (torrent_root, media_root))
-    if plan_path.exists():
-        raise ValueError("Plan already exists; choose a new --plan filename")
-    cache_path = output_path(args.cache or str(plan_path.parent / "hardlink-hashes.sqlite3"), (torrent_root, media_root))
-    if cache_path == plan_path:
-        raise ValueError("Plan and cache must have different paths")
-    errors = []
-    torrents, torrent_skips = inventory(torrent_root, errors)
-    media, media_skips = inventory(media_root, errors)
-    by_inode = defaultdict(list)
+def find_matches(master_root, target_root, masters, targets, counts):
     by_size = defaultdict(list)
-    for entry in torrents:
-        by_inode[inode(entry)].append(entry)
-        by_size[entry["state"]["size"]].append(entry)
-    sample_index = {}
-    source_metadata = {}
-    rows = []
-    hasher = Hashes(cache_path)
-    try:
-        for number, target in enumerate(media, 1):
-            row = {"media": target, "status": "NO_SIZE_MATCH"}
-            try:
-                if inode(target) in by_inode:
-                    row.update(status="ALREADY_LINKED", torrent=by_inode[inode(target)][0])
-                elif target["state"]["size"] in by_size:
-                    size = target["state"]["size"]
-                    if size not in sample_index:
-                        groups = defaultdict(list)
-                        for source in by_size[size]:
-                            groups[hasher.get(torrent_root, source, "sample")].append(source)
-                        sample_index[size] = groups
-                    candidates = sample_index[size].get(hasher.get(media_root, target, "sample"), [])
-                    row["status"] = "NO_CONTENT_MATCH"
-                    if candidates:
-                        digest = hasher.get(media_root, target, "full")
-                        matches = [s for s in candidates if hasher.get(torrent_root, s, "full") == digest]
-                        if matches:
-                            target_metadata = metadata(media_root, target)
-                            for source in matches:
-                                key = json.dumps(source["state"], sort_keys=True)
-                                if key not in source_metadata:
-                                    source_metadata[key] = metadata(torrent_root, source)
-                            def preference(source):
-                                key = json.dumps(source["state"], sort_keys=True)
-                                return (source["state"]["dev"] != target["state"]["dev"],
-                                    source_metadata[key] != target_metadata,
-                                    -source["state"]["nlink"], source["path"])
-                            source = min(matches, key=preference)
-                            attrs = source_metadata[json.dumps(source["state"], sort_keys=True)]
-                            status = "READY"
-                            if source["state"]["dev"] != target["state"]["dev"]:
-                                status = "CROSS_FILESYSTEM"
-                            elif target["state"]["nlink"] > 1:
-                                status = "REVIEW_MULTIPLE_LINKS"
-                            elif attrs != target_metadata:
-                                status = "REVIEW_METADATA"
-                            row.update(status=status, torrent=source, sha256=digest,
-                                torrent_metadata=attrs, media_metadata=target_metadata,
-                                matching_torrents=[s["path"] for s in matches])
-            except (OSError, ValueError) as exc:
-                row.update(status="ERROR", error=str(exc))
-                errors.append({"path": target["path"], "error": str(exc)})
-            rows.append(row)
-            if number % 250 == 0 or time.monotonic() - hasher.last_progress >= 15:
-                log("Matched {:,}/{:,} media files: {}".format(number, len(media), dict(Counter(r["status"] for r in rows))))
-                hasher.last_progress = time.monotonic()
-        summary = dict(Counter(row["status"] for row in rows))
-        potential = sum(row["media"]["state"]["size"] for row in rows if row["status"] == "READY")
-        plan = {"format": FORMAT, "created_utc": timestamp(), "complete": not errors,
-            "torrents_root": str(torrent_root), "media_root": str(media_root),
-            "torrent_files": len(torrents), "media_files": len(media),
-            "skipped_entries": torrent_skips + media_skips, "summary": summary,
-            "potential_duplicate_bytes": potential,
-            "hash_cache_hits": hasher.cache_hits, "bytes_read_for_hashes": hasher.bytes_read,
-            "errors": errors, "files": rows}
-        save_plan(plan_path, plan)
-    finally:
-        hasher.close()
-    log("Summary: " + json.dumps(summary, sort_keys=True))
-    log("READY logical duplicate bytes: {:,} ({:.2f} GiB); actual reclaimed space may differ".format(potential, potential / 2**30))
-    log("Plan: {}\nCache: {}\nNo torrent or media files were changed.".format(plan_path, cache_path))
-    if errors:
-        log("INCOMPLETE: {} errors. Apply is blocked; resolve errors and rescan to a new plan.".format(len(errors)))
-        return 2
-    return 0
+    master_inodes = {inode(entry) for entry in masters}
+    for entry in masters:
+        by_size[entry["state"].size].append(entry)
+    samples = {}
+    hashes = Hashes()
+    matches = []
+    for number, target in enumerate(targets, 1):
+        if number % 250 == 0:
+            log(f"Matching target files: {number:,}/{len(targets):,}")
+        if inode(target) in master_inodes:
+            counts["already_linked"] += 1
+            continue
+        size = target["state"].size
+        if size not in by_size:
+            counts["unmatched"] += 1
+            continue
+        if size not in samples:
+            groups = defaultdict(list)
+            for master in by_size[size]:
+                groups[hashes.get(master_root, master, sample=True)].append(master)
+            samples[size] = groups
+        candidates = samples[size].get(hashes.get(target_root, target, sample=True), [])
+        matching = []
+        digest = None
+        if candidates:
+            digest = hashes.get(target_root, target)
+            matching = [entry for entry in candidates if hashes.get(master_root, entry) == digest]
+        if not matching:
+            counts["unmatched"] += 1
+            continue
+        same_device = [entry for entry in matching if entry["state"].device == target["state"].device]
+        if not same_device:
+            counts["different_filesystem"] += 1
+            log(f"SKIP different filesystem: {target['path']!r}")
+            continue
+        if target["state"].links > 1:
+            counts["target_has_other_links"] += 1
+            log(f"SKIP target already has other hardlinks: {target['path']!r}")
+            continue
+        attributes = entry_xattrs(target_root, target)
+        target_permissions = (target["state"].mode, target["state"].uid, target["state"].gid)
+        compatible = []
+        for master in same_device:
+            master_permissions = (master["state"].mode, master["state"].uid, master["state"].gid)
+            if (master_permissions == target_permissions
+                    and entry_xattrs(master_root, master) == attributes):
+                compatible.append(master)
+        if not compatible:
+            counts["metadata_mismatch"] += 1
+            log(f"SKIP ownership, permissions or extended attributes differ: {target['path']!r}")
+            continue
+        master = min(compatible, key=lambda entry: (-entry["state"].links, entry["path"]))
+        matches.append({"master": master, "target": target, "sha256": digest, "xattrs": attributes})
+    return matches
 
 
-def load_plan(path):
-    with open(path, encoding="utf-8") as handle:
-        plan = json.load(handle)
-    if plan.get("format") != FORMAT or not isinstance(plan.get("files"), list):
-        raise ValueError("Unrecognized plan format")
-    return plan
-
-
-def show(args):
-    plan = load_plan(args.plan)
-    log("Complete: {}\nSummary: {}".format(plan["complete"], json.dumps(plan["summary"], sort_keys=True)))
-    log("Potential logical duplicate bytes: {:,}".format(plan["potential_duplicate_bytes"]))
-    statuses = set(args.status or ["READY", "REVIEW_METADATA", "REVIEW_MULTIPLE_LINKS", "CROSS_FILESYSTEM", "ERROR"])
-    rows = [row for row in plan["files"] if row["status"] in statuses]
-    for row in rows[:args.limit]:
-        log("\n{}  {:,} bytes\n  torrent: {!r}\n  media:   {!r}".format(row["status"],
-            row["media"]["state"]["size"], row.get("torrent", {}).get("path"), row["media"]["path"]))
-        if "error" in row:
-            log("  error: " + row["error"])
-        if row["status"] == "REVIEW_METADATA":
-            log("  Ownership, permissions or extended attributes differ; not applied.")
-        elif row["status"] == "REVIEW_MULTIPLE_LINKS":
-            log("  Media inode already has other links; not applied.")
-    log("\nShowing {} of {} selected rows. Use --status ALREADY_LINKED to inspect existing links.".format(min(len(rows), args.limit), len(rows)))
-    for error in plan.get("errors", [])[:args.limit]:
-        log("Scan error: {!r}: {}".format(error["path"], error["error"]))
-    return 0
-
-
-def audit(handle, event):
-    handle.write(json.dumps(dict(event, utc=timestamp()), ensure_ascii=True) + "\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-
-
-def compare_files(source_fd, target_fd, expected_hash, source_path):
+def compare_files(master_fd, target_fd, expected_hash, path):
     digest = hashlib.sha256()
+    last_progress = time.monotonic()
     total = 0
-    last = time.monotonic()
     while True:
-        left = os.read(source_fd, BLOCK)
-        right = os.read(target_fd, BLOCK)
-        if left != right:
-            raise ValueError("Files are no longer byte-for-byte identical; nothing replaced")
-        if not left:
+        master_data = os.read(master_fd, BLOCK)
+        target_data = os.read(target_fd, BLOCK)
+        if master_data != target_data:
+            raise ValueError(f"Contents changed before replacement: {path!r}")
+        if not master_data:
             break
-        digest.update(left)
-        total += len(left)
-        if time.monotonic() - last >= 15:
-            log("Rechecking {:.2f} GiB: {!r}".format(total / 2**30, source_path))
-            last = time.monotonic()
+        digest.update(master_data)
+        total += len(master_data)
+        if time.monotonic() - last_progress >= 15:
+            log(f"Rechecking {total / 2**30:.2f} GiB: {path!r}")
+            last_progress = time.monotonic()
     if digest.hexdigest() != expected_hash:
-        raise ValueError("Content does not match the scanned SHA-256; nothing replaced")
+        raise ValueError(f"Content changed since matching: {path!r}")
 
 
-def replace_one(row, torrent_root, media_root):
-    source = row["torrent"]
-    target = row["media"]
+def replace_match(master_root, target_root, match, expected_master, counts):
+    master = match["master"]
+    target = match["target"]
     temporary = ".hardlink-match-" + uuid.uuid4().hex + ".tmp"
-    created = False
-    replaced = False
-    with parent_fd(torrent_root, source["path"]) as (src_dir, src_name), \
-         parent_fd(media_root, target["path"]) as (dst_dir, dst_name):
-        src_fd = os.open(src_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_dir)
+    with parent_fd(master_root, master["path"]) as (master_parent, master_name), \
+         parent_fd(target_root, target["path"]) as (target_parent, target_name):
+        master_fd = os.open(master_name, FILE_FLAGS, dir_fd=master_parent)
         try:
-            dst_fd = os.open(dst_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dst_dir)
+            target_fd = os.open(target_name, FILE_FLAGS, dir_fd=target_parent)
             try:
-                before_source = os.fstat(src_fd)
-                before_target = os.fstat(dst_fd)
-                assert_state(before_source, source["state"], source=True)
-                if (before_source.st_dev, before_source.st_ino) == (before_target.st_dev, before_target.st_ino):
-                    return "ALREADY_LINKED", ""
-                assert_state(before_target, target["state"])
-                if before_target.st_nlink != 1:
-                    raise ValueError("Media file acquired another hardlink; rescan")
-                if before_source.st_dev != before_target.st_dev:
-                    raise ValueError("Files are now on different filesystems")
-                if row["torrent_metadata"] != row["media_metadata"]:
-                    raise ValueError("Plan has conflicting metadata; rescan")
-                if xattrs(src_fd) != row["torrent_metadata"]["xattrs"] or xattrs(dst_fd) != row["media_metadata"]["xattrs"]:
-                    raise ValueError("Extended attributes changed; rescan")
-                compare_files(src_fd, dst_fd, row["sha256"], source["path"])
-                assert_state(os.fstat(src_fd), state(before_source))
-                assert_state(os.fstat(dst_fd), state(before_target))
-                os.link(src_name, temporary, src_dir_fd=src_dir, dst_dir_fd=dst_dir, follow_symlinks=False)
-                created = True
-                linked = os.stat(temporary, dir_fd=dst_dir, follow_symlinks=False)
-                if (linked.st_dev, linked.st_ino) != (before_source.st_dev, before_source.st_ino):
-                    raise ValueError("Torrent pathname changed during linking; nothing replaced")
-                # link() changes source ctime/link count, so ignore those two fields
-                # after our own link creation, while still checking the other fields.
-                assert_state(os.fstat(src_fd), state(before_source), source=True)
-                assert_state(os.stat(src_name, dir_fd=src_dir, follow_symlinks=False), state(before_source), source=True)
-                assert_state(os.fstat(dst_fd), state(before_target))
-                assert_state(os.stat(dst_name, dir_fd=dst_dir, follow_symlinks=False), state(before_target))
-                if xattrs(src_fd) != row["torrent_metadata"]["xattrs"]:
-                    raise ValueError("Source attributes changed during linking; nothing replaced")
-                os.replace(temporary, dst_name, src_dir_fd=dst_dir, dst_dir_fd=dst_dir)
-                replaced = True
-                created = False
-                after = os.stat(dst_name, dir_fd=dst_dir, follow_symlinks=False)
-                if (after.st_dev, after.st_ino) != (before_source.st_dev, before_source.st_ino):
-                    raise ValueError("Post-replacement inode verification failed")
+                master_before = os.fstat(master_fd)
+                target_before = os.fstat(target_fd)
+                check_state(master_before, expected_master)
+                check_state(target_before, target["state"])
+                if xattrs(master_fd) != match["xattrs"] or xattrs(target_fd) != match["xattrs"]:
+                    raise ValueError(f"Attributes changed before replacement: {target['path']!r}")
+                compare_files(master_fd, target_fd, match["sha256"], target["path"])
+                check_state(os.fstat(master_fd), state(master_before))
+                check_state(os.fstat(target_fd), state(target_before))
                 try:
-                    os.fsync(dst_dir)
+                    os.link(master_name, temporary, src_dir_fd=master_parent,
+                            dst_dir_fd=target_parent, follow_symlinks=False)
                 except OSError as exc:
-                    return "LINKED", "Directory fsync unsupported/failed: " + str(exc)
-                return "LINKED", ""
-            finally:
-                os.close(dst_fd)
-        except Exception as exc:
-            if replaced:
-                return "APPLIED_NEEDS_REVIEW", str(exc)
-            raise
-        finally:
-            os.close(src_fd)
-            if created:
-                os.unlink(temporary, dir_fd=dst_dir)
-
-
-def apply(args):
-    plan = load_plan(args.plan)
-    if not plan.get("complete") or plan.get("errors"):
-        raise ValueError("Incomplete/error-containing plan cannot be applied; rescan")
-    torrent_root, media_root = roots(plan["torrents_root"], plan["media_root"])
-    if str(torrent_root) != plan["torrents_root"] or str(media_root) != plan["media_root"]:
-        raise ValueError("Root paths changed since scan; rescan")
-    plan_path = output_path(args.plan, (torrent_root, media_root))
-    log_path = output_path(str(plan_path) + ".apply.jsonl", (torrent_root, media_root))
-    rows = [row for row in plan["files"] if row["status"] == "READY"]
-    if args.limit is not None:
-        rows = rows[:args.limit]
-    seen = set()
-    for row in rows:
-        target = row["media"]["path"]
-        if target in seen:
-            raise ValueError("Plan contains duplicate media destinations")
-        seen.add(target)
-        # Validate all selected paths BEFORE starting any replacements.
-        with parent_fd(torrent_root, row["torrent"]["path"]), parent_fd(media_root, target):
-            pass
-        if row["media"]["state"]["nlink"] != 1:
-            raise ValueError("READY entry unexpectedly has multiple media hardlinks")
-    if not rows:
-        log("No READY entries selected. No changes made.")
-        return 0
-    log("Selected {} candidates. Torrent files remain the source; media entries will be replaced.".format(len(rows)))
-    if not args.yes:
-        log("Pause downloads, imports, mover and other writers before continuing.")
-        if input("Type LINK to apply this plan: ") != "LINK":
-            raise ValueError("Cancelled; no changes made")
-    lock_fd = open_directory(media_root)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        log_fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        counts = Counter()
-        with os.fdopen(log_fd, "a", encoding="utf-8") as handle:
-            for row in rows:
-                event = {"torrent": row["torrent"]["path"], "media": row["media"]["path"], "sha256": row["sha256"]}
-                audit(handle, dict(event, status="STARTED"))
+                    if exc.errno in (errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                        raise LinkUnavailable(str(exc)) from exc
+                    raise
                 try:
-                    status, detail = replace_one(row, torrent_root, media_root)
-                except (OSError, ValueError) as exc:
-                    status = "LINK_UNSUPPORTED" if isinstance(exc, OSError) and exc.errno in (errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS) else "ERROR"
-                    detail = str(exc)
-                counts[status] += 1
-                audit(handle, dict(event, status=status, detail=detail))
-                log("{}: {!r}{}".format(status, row["media"]["path"], "; " + detail if detail else ""))
-        log("Apply summary: {}\nAudit log: {}".format(dict(counts), log_path))
-        return 2 if any(counts[s] for s in ("ERROR", "LINK_UNSUPPORTED", "APPLIED_NEEDS_REVIEW")) else 0
-    finally:
-        os.close(lock_fd)
+                    linked = os.stat(temporary, dir_fd=target_parent, follow_symlinks=False)
+                    if not stat.S_ISREG(linked.st_mode) or (linked.st_dev, linked.st_ino) != inode(master):
+                        raise ValueError("Master pathname changed while creating the hardlink")
+                    check_state(os.fstat(master_fd), state(master_before), after_link=True)
+                    check_state(os.stat(master_name, dir_fd=master_parent, follow_symlinks=False), state(master_before), after_link=True)
+                    check_state(os.fstat(target_fd), state(target_before))
+                    check_state(os.stat(target_name, dir_fd=target_parent, follow_symlinks=False), state(target_before))
+                    if xattrs(master_fd) != match["xattrs"]:
+                        raise ValueError("Master attributes changed during linking")
+                    os.replace(temporary, target_name, src_dir_fd=target_parent, dst_dir_fd=target_parent)
+                    counts["linked"] += 1
+                    after = os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
+                    if (after.st_dev, after.st_ino) != inode(master):
+                        raise ValueError(f"Replacement needs inspection: {target['path']!r}")
+                    try:
+                        os.fsync(target_parent)
+                    except OSError as exc:
+                        log(f"WARNING directory synchronization failed after linking {target['path']!r}: {exc}")
+                    return state(os.fstat(master_fd))
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=target_parent)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(target_fd)
+        finally:
+            os.close(master_fd)
 
 
-def positive(value):
-    number = int(value)
-    if number < 1:
-        raise argparse.ArgumentTypeError("must be at least 1")
-    return number
+def interrupted(signum, frame):
+    raise KeyboardInterrupt
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    commands = parser.add_subparsers(dest="command", required=True)
-    scan_parser = commands.add_parser("scan", help="Read-only recursive content scan; write a plan and cache")
-    scan_parser.add_argument("--torrents", default="/mnt/user/data/torrents")
-    scan_parser.add_argument("--media", default="/mnt/user/data/media")
-    scan_parser.add_argument("--plan", default="hardlink-plan.json")
-    scan_parser.add_argument("--cache", help="SQLite hash cache (default: hardlink-hashes.sqlite3 beside plan)")
-    scan_parser.set_defaults(func=scan)
-    show_parser = commands.add_parser("show", help="Show summary and selected plan entries")
-    show_parser.add_argument("--plan", default="hardlink-plan.json")
-    show_parser.add_argument("--limit", type=positive, default=20)
-    show_parser.add_argument("--status", action="append", help="Filter status; repeat to select several")
-    show_parser.set_defaults(func=show)
-    apply_parser = commands.add_parser("apply", help="Recheck and apply only READY entries in a saved plan")
-    apply_parser.add_argument("--plan", default="hardlink-plan.json")
-    apply_parser.add_argument("--limit", type=positive, help="Maximum candidates to process this run")
-    apply_parser.add_argument("--yes", action="store_true", help="Skip the LINK confirmation prompt")
-    apply_parser.set_defaults(func=apply)
-    args = parser.parse_args()
+    parser.add_argument("--master", required=True, help="retained master directory, scanned recursively")
+    parser.add_argument("--target", required=True, help="directory containing existing files to deduplicate")
+    parser.add_argument("--apply", action="store_true", help="replace eligible target copies with hardlinks (default: preview)")
+    args = parser.parse_args(argv)
+    counts = Counter()
+    lock_fd = None
+    signal.signal(signal.SIGTERM, interrupted)
     try:
-        return args.func(args)
+        master_root = Path(args.master).resolve(strict=True)
+        target_root = Path(args.target).resolve(strict=True)
+        if not master_root.is_dir() or not target_root.is_dir():
+            raise ValueError("Both --master and --target must be existing directories")
+        if (master_root == target_root or master_root in target_root.parents
+                or target_root in master_root.parents or os.path.samefile(master_root, target_root)):
+            raise ValueError("Master and target must be separate, non-overlapping trees")
+        if args.apply:
+            lock_fd = open_directory(target_root)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        log(f"Mode: {'APPLY' if args.apply else 'DRY RUN'}\nMaster: {str(master_root)!r}\nTarget: {str(target_root)!r}")
+        masters = inventory(master_root, counts)
+        targets = inventory(target_root, counts)
+        matches = find_matches(master_root, target_root, masters, targets, counts)
+        counts["eligible"] = len(matches)
+        potential = sum(match["target"]["state"].size for match in matches)
+        log(f"Eligible: {len(matches):,} files, {potential / 2**30:.2f} GiB of logical duplicate data")
+        master_states = {inode(entry): entry["state"] for entry in masters}
+        for match in matches:
+            master = match["master"]
+            target = match["target"]
+            if not args.apply:
+                log(f"WOULD LINK target {target['path']!r} to master {master['path']!r}")
+                continue
+            try:
+                updated = replace_match(master_root, target_root, match, master_states[inode(master)], counts)
+                master_states[inode(master)] = updated
+                log(f"LINKED target {target['path']!r} to master {master['path']!r}")
+            except LinkUnavailable as exc:
+                counts["unsupported_link"] += 1
+                log(f"SKIP hardlink unavailable for {target['path']!r}: {exc}")
+        log("Summary: " + ", ".join(f"{name}={number}" for name, number in sorted(counts.items())))
+        return 1 if counts["unsupported_link"] else 0
     except KeyboardInterrupt:
-        log("Interrupted. Earlier completed replacements remain; inspect the audit log before rerunning.")
+        print(f"Interrupted. Completed replacements: {counts['linked']}.", file=sys.stderr)
         return 130
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, EOFError) as exc:
-        print("Error: " + str(exc), file=sys.stderr, flush=True)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Error: {exc!s}\nCompleted replacements: {counts['linked']}. Earlier replacements remain in place.", file=sys.stderr)
         return 1
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 if __name__ == "__main__":
