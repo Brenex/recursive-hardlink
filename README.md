@@ -6,6 +6,15 @@ Restore hardlink relationships between torrent files and their organized media-l
 
 Repair candidates require both paths to exist and contain identical bytes. This covers independent copies left by copy-based imports, restores, or other operations that broke a previous hardlink relationship.
 
+## Python tools
+
+| Script | Purpose | Typical command |
+| --- | --- | --- |
+| `hardlink-matches.py` | Match torrent files to existing organized media files by content and repair eligible hardlinks. | `python3 hardlink-matches.py scan` |
+| `recursive-hardlink.py` | Recreate a source directory's relative paths and empty directories using hardlinks. | `python3 recursive-hardlink.py -s SOURCE -d DESTINATION -n` |
+
+Both utilities are standalone Python programs using the standard library. Use `hardlink-matches.py` for torrent-to-media repairs where files may have been renamed or sorted into different folders. Use `recursive-hardlink.py` when the destination should mirror the source directory layout.
+
 ## Scope
 
 | Tree | Default path | Role |
@@ -29,6 +38,7 @@ An existing match of device ID and inode is reported as `ALREADY_LINKED`. Separa
 | Tool | Purpose |
 | --- | --- |
 | `hardlink-matches` | Repair torrent-to-media hardlink relationships through the two specified directory trees. |
+| `recursive-hardlink.py` | Create a directory tree of hardlinks with the same relative paths as its source. |
 | `unraid-cross-disk-deduplicator` | Consolidate identical files from different physical array disks onto a retained source disk. |
 
 Physical disk consolidation belongs to the cross-disk tool. `hardlink-matches` relies on the filesystem accepting a hardlink at the existing media location. On Unraid, a shared `/mnt/user` namespace can span multiple underlying filesystems, so matching device IDs alone are insufficient to guarantee successful linking.
@@ -40,11 +50,11 @@ Physical disk consolidation belongs to the cross-disk tool. `hardlink-matches` r
 - Permission to read both trees and create and replace entries in the media directories.
 - A filesystem configuration that supports hardlinks for the selected paths.
 
-The application is a standalone Python script. Run it directly on the Unraid host with `python3`.
+Run the Python utilities directly on the Unraid host with `python3`.
 
 ## Installation
 
-Place `hardlink-matches.py` and this README in a working directory outside both scanned trees. The examples below use `/mnt/user/scripts/hardlink-matches/`.
+Place `hardlink-matches.py` and this README in a working directory outside both scanned trees. Add `recursive-hardlink.py` in the same directory if you also use directory mirroring. The examples below use `/mnt/user/scripts/hardlink-matches/`.
 
 ```bash
 mkdir -p /mnt/user/scripts/hardlink-matches
@@ -53,6 +63,21 @@ python3 --version
 ```
 
 Save the script in that directory before continuing. If you already keep it in `/mnt/user/scripts/recursive-hardlink/`, use that directory instead.
+
+### Migrating the directory-mirroring utility to Python
+
+`recursive-hardlink.py` replaces `recursive-hardlink.sh` for directory mirroring and retains the `-s`, `-d`, `-n`, `-y`, and `-v` options.
+
+Update any directory-mirroring scheduler entries to invoke the Python file. For example, the Python invocation for a script saved in your existing directory is below.
+
+```bash
+python3 /mnt/user/scripts/recursive-hardlink/recursive-hardlink.py \
+  -s /path/to/source \
+  -d /path/to/mirror \
+  -n
+```
+
+Replace the example source and destination with your intended directories. The `-n` option previews the operation. The `hardlink-matches.py` scan, review, and apply commands below continue to handle content-based torrent-to-media repair.
 
 ## Quick start
 
@@ -209,6 +234,45 @@ python3 hardlink-matches.py show --help
 python3 hardlink-matches.py apply --help
 ```
 
+## Directory mirroring with recursive-hardlink.py
+
+This utility places the source directory's contents directly inside the destination. Each source file receives a hardlink at the same relative path, and empty directories are recreated. For example, `SOURCE/season/episode.mkv` becomes `DESTINATION/season/episode.mkv`.
+
+### Preview and apply
+
+```bash
+python3 recursive-hardlink.py -s /path/to/source -d /path/to/mirror -n
+```
+
+Review the displayed plan, then apply it with interactive confirmation.
+
+```bash
+python3 recursive-hardlink.py -s /path/to/source -d /path/to/mirror
+```
+
+Type `yes` when prompted. For an unattended invocation, use `-y`. Add `-v` to print created directories and links.
+
+```bash
+python3 recursive-hardlink.py -s /path/to/source -d /path/to/mirror -y -v
+```
+
+### Options and behavior
+
+| Option | Purpose |
+| --- | --- |
+| `-s`, `--source PATH` | Existing source directory. Required. |
+| `-d`, `--destination PATH` | Destination directory, created as needed. Required. |
+| `-n`, `--dry-run` | Validate and display planned changes. |
+| `-y`, `--yes` | Apply without typing `yes`. |
+| `-v`, `--verbose` | Print created directories and hardlinks during application. |
+| `-h`, `--help` | Show help. |
+
+Preflight inventories the source and checks destination conflicts and known filesystem mismatches before creating destination entries. Existing correct hardlinks are skipped. An independent file at the same destination path is a conflict, even if its contents happen to match. Use the content matcher for an existing, independently copied media library.
+
+The source and destination must be separate, non-overlapping trees. Root path aliases are resolved before this check. Source symlinks and special entries are skipped, and symlinks encountered within the destination tree are rejected. New directories use the process umask. Linked files share the source's contents and metadata.
+
+Keep both trees stable during execution. Earlier created directories and links remain available if a later operation fails, and the error output reports their counts. A dry run describes its current inventory, while a subsequent invocation performs a fresh scan and preflight. Directory-mirroring runs report their results in the terminal. The saved plan, SQLite cache, and JSONL audit log described above belong to `hardlink-matches.py`.
+
 ## Troubleshooting and recovery
 
 | Result | Action |
@@ -237,9 +301,21 @@ Matching device IDs and inode numbers identify the shared file. The link count n
 
 ## Exit codes
 
+### hardlink-matches.py
+
 | Code | Meaning |
 | --- | --- |
 | `0` | Command completed successfully, including runs with no eligible work. Review statuses may still be present. |
 | `1` | A handled command-level error, such as an existing plan, rejected path, or cancelled confirmation. |
 | `2` | Incomplete scan, apply entry errors, unsupported links, or an applied entry requiring review. Argument parsing errors also use this code. |
 | `130` | Interrupted by `Ctrl+C`. Inspect the audit log for any completed replacements. |
+
+### recursive-hardlink.py
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Dry run or application completed successfully, including runs with no new links needed. |
+| `1` | Input, preflight, filesystem, confirmation, or execution error. Execution errors report how many links and directories were created. |
+| `2` | Invalid or missing command-line arguments. |
+| `130` | Interrupted by `Ctrl+C`. |
+| `143` | Interrupted by `SIGTERM`. |
